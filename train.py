@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import pickle as pkl
+import random
 from argparse import ArgumentParser
 from collections import defaultdict
 from datetime import datetime
@@ -9,6 +10,7 @@ from itertools import chain
 from pprint import pformat
 
 import torch
+import torch.nn.functional as F
 from ignite.contrib.handlers.param_scheduler import PiecewiseLinear
 from ignite.contrib.handlers.tensorboard_logger import (
     OptimizerParamsHandler, OutputHandler, TensorboardLogger)
@@ -146,6 +148,7 @@ def main():
     else:
         model = BartForSequenceClassification.from_pretrained(
             args.model_checkpoint)
+    model_config = BartConfig.from_pretrained(args.model_checkpoint)
     model.resize_token_embeddings(len(tokenizer))
     model.to(args.device)
     optimizer = AdamW(model.parameters(), lr=args.lr)
@@ -199,14 +202,29 @@ def main():
         if engine.state.iteration % args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
-        logits = logits.argmax(dim=1)
         if not args.with_expl:
-            lbl_accuracy = torch.eq(label, logits).float().sum() / len(label)
+            lbl_accuracy = torch.eq(label, logits.argmax(
+                dim=1)).float().sum() / len(label)
             return {
                 'loss': loss.item(),
                 'lbl_accuracy': lbl_accuracy.item()
             }
         else:
+            if engine.state.iteration % (args.gradient_accumulation_steps * 500) == 0:
+                input_output = list(zip(input_ids,
+                                        expl_ids,
+                                        logits))
+                random_item = random.choice(input_output)
+                in_sent = tokenizer.decode(random_item[0])
+                expl = tokenizer.decode(random_item[1],
+                                        skip_special_tokens=True)
+                out_expl = tokenizer.decode(random_item[2].argmax(dim=1),
+                                            skip_special_tokens=True)
+                logger.info(
+                    f'PREMISE+HYPOTHESIS: {in_sent.split(tokenizer.pad_token)[0]}')
+                logger.info(f'GROUND EXPL: {expl}')
+                logger.info(f'GEN. EXPL {out_expl}')
+                logger.info('--------------------------------')
             return {
                 'loss': loss.item(),
             }
@@ -233,11 +251,10 @@ def main():
             logits, _ = output
 
             if args.with_expl:
-                logits_shifted = logits[..., :-1,
-                                        :].contiguous().view(-1, logits.size(-1))
-                label_shifted = expl_ids[..., 1:].contiguous().view(-1)
+                logits_shifted = logits.view(-1, model_config.vocab_size)
+                label_shifted = expl_ids.view(-1)
             else:
-                logits_shifted = logits.view(-1, logits.size(-1))
+                logits_shifted = logits.view(-1, model_config.num_labels)
                 label_shifted = label.view(-1)
             return logits_shifted, label_shifted
 
@@ -262,11 +279,11 @@ def main():
     '''Prepare metrics - note how we compute distributed metrics'''
     RunningAverage(output_transform=lambda x: x['loss']).attach(
         trainer, "loss")
+    RunningAverage(output_transform=lambda x: math.exp(
+        average_distributed_scalar(x['loss'], args))).attach(trainer, "ppl")
     if not args.with_expl:
         RunningAverage(output_transform=lambda x: 100 * x['lbl_accuracy']).attach(
             trainer, "lbl_accuracy")
-    RunningAverage(output_transform=lambda x: math.exp(
-        average_distributed_scalar(x['loss'], args))).attach(trainer, "ppl")
 
     metrics = {}
     metrics["lbl_loss"] = Loss(torch.nn.CrossEntropyLoss(),
