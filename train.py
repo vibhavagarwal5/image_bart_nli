@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Subset
 from transformers import *
 
 from dataset import InferenceDataset, collate_fn, get_data
+import ibart
 
 logger = logging.getLogger(__file__)
 
@@ -59,7 +60,7 @@ def get_data_loaders(args, tokenizer):
     dev_dataloader = DataLoader(dev_dataset,
                                 batch_size=args.batch_size,
                                 shuffle=(not args.distributed),
-                                num_workers=4,
+                                num_workers=8,
                                 collate_fn=lambda x: collate_fn(x,
                                                                 tokenizer.pad_token_id,
                                                                 no_image=args.no_image,
@@ -67,7 +68,7 @@ def get_data_loaders(args, tokenizer):
     train_dataloader = DataLoader(train_dataset,
                                   batch_size=args.batch_size,
                                   shuffle=(not args.distributed),
-                                  num_workers=4,
+                                  num_workers=8,
                                   collate_fn=lambda x: collate_fn(x,
                                                                   tokenizer.pad_token_id,
                                                                   no_image=args.no_image,
@@ -102,7 +103,7 @@ def get_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
                         else "cpu", help="Device (cuda or cpu)")
     parser.add_argument("--fp16", type=str, default="",
-                        help="Set to 00, 01, 02 or 03 for fp16 training (see apex documentation)")
+                        help="Set to O0, O1, O2, O3 for fp16 training (see apex documentation)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank for distributed training (-1: not distributed)")
     parser.add_argument("--output_folder", type=str,
@@ -114,6 +115,8 @@ def get_args():
 
 def main():
     args = get_args()
+    if not args.no_image:
+        args.no_premise = True
 
     '''Setup'''
     t = datetime.today()
@@ -130,6 +133,10 @@ def main():
     # This is a logger.warning: it will be printed by all distributed processes
     logger.warning(f"Running process {args.local_rank}")
     logger.info(f"Arguments: {pformat(args)}")
+    logger.info(f'Image used:{args.no_image}')
+    logger.info(f'Premise used:{args.no_premise}')
+    logger.info(
+        f'Explanations used(Generation if True else Classification):{args.with_expl}')
 
     '''Initialize distributed training if needed'''
     args.distributed = (args.local_rank != -1)
@@ -141,13 +148,17 @@ def main():
 
     logger.info(
         "Prepare tokenizer, pretrained model and optimizer - add special tokens for fine-tuning")
-    tokenizer = BartTokenizer.from_pretrained(args.model_checkpoint)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_checkpoint)
     if args.with_expl:
-        model = BartForConditionalGeneration.from_pretrained(
+        model = AutoModelForSeq2SeqLM.from_pretrained(
             args.model_checkpoint)
     else:
-        model = BartForSequenceClassification.from_pretrained(
-            args.model_checkpoint)
+        if args.no_image:
+            model = BartForSequenceClassification.from_pretrained(
+                args.model_checkpoint)
+        else:
+            model = ibart.BartForSequenceClassification.from_pretrained(
+                args.model_checkpoint)
     model_config = BartConfig.from_pretrained(args.model_checkpoint)
     model.resize_token_embeddings(len(tokenizer))
     model.to(args.device)
@@ -188,9 +199,15 @@ def main():
                            attention_mask=input_mask,
                            labels=expl_ids)
         else:
-            output = model(input_ids=input_ids,
-                           attention_mask=input_mask,
-                           labels=label)
+            if args.no_image:
+                output = model(input_ids=input_ids,
+                               attention_mask=input_mask,
+                               labels=label)
+            else:
+                output = model(input_ids=input_ids,
+                               images=image,
+                               attention_mask=input_mask,
+                               labels=label)
         loss, logits, _ = output
 
         loss = loss / args.gradient_accumulation_steps
@@ -246,8 +263,13 @@ def main():
                 else:
                     image, input_ids, label, input_mask = batch
 
-            output = model(input_ids=input_ids,
-                           attention_mask=input_mask)
+            if args.no_image:
+                output = model(input_ids=input_ids,
+                               attention_mask=input_mask)
+            else:
+                output = model(input_ids=input_ids,
+                               images=image,
+                               attention_mask=input_mask)
             logits, _ = output
 
             if args.with_expl:
@@ -348,15 +370,6 @@ def main():
 
     '''Run the training'''
     trainer.run(train_loader, max_epochs=args.n_epochs)
-
-    '''
-    On the main process: close tensorboard logger and rename the last checkpoint (for easy re-loading with OpenAIGPTModel.from_pretrained method)
-    '''
-    if args.local_rank in [-1, 0] and args.n_epochs > 0:
-        # TODO: PR in ignite to have better access to saved file paths (cleaner)
-        os.rename(os.path.join(output_dir, checkpoint_handler._saved[-1][1]),
-                  os.path.join(output_dir, WEIGHTS_NAME))
-        tb_logger.close()
 
 
 if __name__ == "__main__":

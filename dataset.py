@@ -120,17 +120,22 @@ def collate_fn(batch, pad_token, no_image=False, with_expl=True):
         input_ids = padding(input_ids, max_len, pad_token)
         expl_ids = padding(expl_ids, max_len, pad_token)
         label = torch.tensor(label).long()
-        input_mask = (input_ids != pad_token).long()
-        output = (input_ids, label, expl_ids, input_mask)
+        output = (input_ids, label, expl_ids)
     else:
         max_len_inp_ids = max(len(s) for s in input_ids)
         input_ids = padding(input_ids, max_len_inp_ids, pad_token)
         label = torch.tensor(label).long()
-        input_mask = (input_ids != pad_token).long()
-        output = (input_ids, label, input_mask)
+        output = (input_ids, label)
     if not no_image:
-        image = torch.tensor(image).long()
-        output = (image,) + output
+        image = torch.tensor(image)
+        input_mask = input_ids.ne(pad_token).long()
+        image_mask = torch.ones((len(image), 36)).long()
+        input_mask = torch.cat([image_mask, input_mask], dim=1)
+        output = (image,) + output + (input_mask,)
+    else:
+        input_mask = input_ids.ne(pad_token).long()
+        output = output + (input_mask,)
+
     return output   # image, input_ids, label, expl_ids, input_mask
 
 
@@ -157,6 +162,9 @@ if __name__ == "__main__":
     parser.add_argument("--final_data_path", type=str,
                         default="/home/hdd1/vibhav/VE-SNLI/DSTC8-AVSD-vibhav/vesnli/data/lbl1_expl_out", help="Path of the folder where dataset is to be stored")
     args = parser.parse_args()
+
+    if not args.no_image:
+        args.no_premise = True
 
     tokenizer = BartTokenizer.from_pretrained('facebook/bart-large')
 
