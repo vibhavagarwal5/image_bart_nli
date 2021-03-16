@@ -1,4 +1,4 @@
-# # Image BART (Quick prototyping)
+# Image BART (Quick prototyping)
 
 Finetuned BART by inputting Faster RCNN object features concatenated with the textual tokens. Tested with [e-SNLI-VE dataset](https://github.com/virginie-do/e-SNLI-VE).
 
